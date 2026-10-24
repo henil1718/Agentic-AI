@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useRef } from 'react';
 import {
   Activity,
   ArrowUpRight,
@@ -10,6 +10,8 @@ import {
   Play,
   Rocket,
   Workflow,
+  Mic,
+  Square,
 } from 'lucide-react';
 import { supabase } from './supabase';
 
@@ -76,6 +78,10 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [isConnected, setIsConnected] = useState(false);
 
+  // --- Voice Recognition State ---
+  const [isListening, setIsListening] = useState(false);
+  const recognitionRef = useRef<any>(null);
+
   useEffect(() => {
     const channel = supabase
       .channel('custom-all-channel')
@@ -99,6 +105,49 @@ export default function App() {
       void supabase.removeChannel(channel);
     };
   }, []);
+
+  // --- Speech-to-Text Logic ---
+  const toggleListening = () => {
+    if (isListening) {
+      recognitionRef.current?.stop();
+      setIsListening(false);
+      return;
+    }
+
+    const SpeechRecognition =
+      (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+
+    if (!SpeechRecognition) {
+      alert(
+        'Your browser does not support the Web Speech API. Please try Chrome, Safari, or Edge.',
+      );
+      return;
+    }
+
+    const recognition = new SpeechRecognition();
+    recognition.continuous = false;
+    recognition.interimResults = true;
+
+    recognition.onstart = () => setIsListening(true);
+
+    recognition.onresult = (event: any) => {
+      const transcript = Array.from(event.results)
+        .map((result: any) => result[0])
+        .map((result: any) => result.transcript)
+        .join('');
+      setPrompt(transcript);
+    };
+
+    recognition.onerror = (event: any) => {
+      console.error('Speech recognition error', event.error);
+      setIsListening(false);
+    };
+
+    recognition.onend = () => setIsListening(false);
+
+    recognitionRef.current = recognition;
+    recognition.start();
+  };
 
   const handleExecute = async () => {
     const task = prompt.trim();
@@ -186,37 +235,70 @@ export default function App() {
             </p>
           </div>
 
-          <form
-            className="flex flex-col gap-3 rounded-2xl border border-gray-200 bg-white p-3 shadow-sm sm:flex-row"
-            onSubmit={(event) => {
-              event.preventDefault();
-              void handleExecute();
-            }}
-          >
-            <label className="sr-only" htmlFor="task-prompt">
-              Task prompt
-            </label>
-            <input
-              id="task-prompt"
-              type="text"
-              value={prompt}
-              onChange={(event) => setPrompt(event.target.value)}
-              placeholder="Describe the task for your agents..."
-              className="min-w-0 flex-1 bg-transparent px-3 py-2.5 text-sm text-[#3f3f3f] outline-none placeholder:text-gray-400"
-            />
-            <button
-              type="submit"
-              disabled={isSubmitting}
-              className="inline-flex items-center justify-center gap-2 rounded-xl bg-[#e2725b] px-5 py-2.5 text-sm font-semibold text-white transition hover:bg-[#d4634c] disabled:cursor-not-allowed disabled:opacity-60"
+          <div>
+            <form
+              className={`flex flex-col gap-3 rounded-2xl border bg-white p-3 shadow-sm sm:flex-row transition-colors ${
+                isListening ? 'border-[#e2725b]/50' : 'border-gray-200'
+              }`}
+              onSubmit={(event) => {
+                event.preventDefault();
+                void handleExecute();
+              }}
             >
-              {isSubmitting ? (
-                <LoaderCircle className="animate-spin" size={16} />
-              ) : (
-                <Play size={15} fill="currentColor" />
-              )}
-              {isSubmitting ? 'Starting...' : 'Execute Task'}
-            </button>
-          </form>
+              <label className="sr-only" htmlFor="task-prompt">
+                Task prompt
+              </label>
+              <input
+                id="task-prompt"
+                type="text"
+                value={prompt}
+                onChange={(event) => setPrompt(event.target.value)}
+                placeholder={
+                  isListening
+                    ? 'Listening...'
+                    : 'Describe the task for your agents...'
+                }
+                className="min-w-0 flex-1 bg-transparent px-3 py-2.5 text-sm text-[#3f3f3f] outline-none placeholder:text-gray-400"
+              />
+
+              {/* Voice Button */}
+              <button
+                type="button"
+                onClick={toggleListening}
+                className={`inline-flex h-[42px] w-[42px] shrink-0 items-center justify-center rounded-xl transition ${
+                  isListening
+                    ? 'animate-pulse border border-red-200 bg-red-50 text-red-500'
+                    : 'border border-gray-200 bg-white text-gray-400 hover:border-[#e2725b]/30 hover:bg-[#e2725b]/5 hover:text-[#e2725b]'
+                }`}
+                title={isListening ? 'Stop listening' : 'Start speaking'}
+              >
+                {isListening ? (
+                  <Square size={16} fill="currentColor" />
+                ) : (
+                  <Mic size={18} />
+                )}
+              </button>
+
+              <button
+                type="submit"
+                disabled={isSubmitting}
+                className="inline-flex h-[42px] shrink-0 items-center justify-center gap-2 rounded-xl bg-[#e2725b] px-5 text-sm font-semibold text-white transition hover:bg-[#d4634c] disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {isSubmitting ? (
+                  <LoaderCircle className="animate-spin" size={16} />
+                ) : (
+                  <Play size={15} fill="currentColor" />
+                )}
+                {isSubmitting ? 'Starting...' : 'Execute Task'}
+              </button>
+            </form>
+            {isListening && (
+              <p className="ml-2 mt-2 animate-pulse text-xs font-medium text-[#e2725b]">
+                Recording... speak your prompt into the microphone.
+              </p>
+            )}
+          </div>
+
           {error && (
             <p className="mt-3 text-sm text-red-500" role="alert">
               {error}
@@ -277,7 +359,9 @@ export default function App() {
                       <Icon size={18} />
                     </div>
                     <div>
-                      <h2 className="font-medium text-[#2b2b2b]">{stage.label}</h2>
+                      <h2 className="font-medium text-[#2b2b2b]">
+                        {stage.label}
+                      </h2>
                       <p className="mt-1 text-xs leading-5 text-gray-500">
                         {stage.description}
                       </p>
