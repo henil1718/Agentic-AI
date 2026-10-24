@@ -2,12 +2,13 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 from dotenv import load_dotenv
 from openai import OpenAI
 from pydantic import BaseModel
 from supabase import Client, create_client
+from langgraph.graph import StateGraph, START, END
 
 load_dotenv(Path(__file__).with_name(".env"))
 
@@ -19,50 +20,132 @@ if not supabase_url or not supabase_key:
 
 supabase: Client = create_client(supabase_url, supabase_key)
 
-class ArchitectSchema(BaseModel):
-    goal: str
-    constraints: list[str]
-    tech_stack: list[str]
-
 def _save_agent_log(run_id: str, agent_role: str, payload: dict[str, Any]) -> None:
     supabase.table("agent_logs").insert(
         {"run_id": run_id, "agent_role": agent_role, "payload": payload}
     ).execute()
 
 def _get_client(role: str) -> OpenAI:
-    """Fetches the specific API key for the requested agent role, defaulting to OPENAI_API_KEY if missing."""
     env_map = {
         "architect": "ARCHITECT_API_KEY",
         "coder": "CODER_API_KEY",
         "deployer": "DEPLOYER_API_KEY"
     }
-    
     key_name = env_map.get(role)
-    api_key = os.getenv(key_name)
-    
-    if not api_key:
-        api_key = os.getenv("OPENAI_API_KEY")
+    api_key = os.getenv(key_name) or os.getenv("OPENAI_API_KEY")
         
     if not api_key:
-        raise ValueError(f"{key_name} and OPENAI_API_KEY are missing in .env file.")
+        raise ValueError(f"{key_name} and OPENAI_API_KEY are missing.")
         
-    return OpenAI(
-        api_key=api_key,
-        base_url="https://api.groq.com/openai/v1",
-    )
+    return OpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1")
 
-def _internal_code_checker(artifacts: dict, schema_json: str) -> dict:
-    """Hidden reviewer uses the Coder's API key to validate work."""
+# --- 1. Define the Global State ---
+class HandoffState(TypedDict):
+    run_id: str
+    prompt: str
+    architect_schema: str
+    artifacts: dict
+    feedback: str
+    retry_count: int
+    is_approved: bool
+
+# --- 2. Define the Nodes ---
+def architect_node(state: HandoffState):
+    time.sleep(1)
+    client = _get_client("architect")
+    
+    system_content = (
+        "You are an Expert Software Architect designing a technical specification for a downstream Coder agent. "
+        "Return a strictly formatted JSON object with exactly three fields: "
+        "1. 'goal', 2. 'constraints', 3. 'tech_stack'. "
+        "Output ONLY valid JSON."
+    )
+    
+    response = client.chat.completions.create(
+        model="openai/gpt-oss-120b",
+        messages=[
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": f"Task: {state['prompt']}"},
+        ],
+        response_format={"type": "json_object"},
+    )
+    
+    schema_dict = json.loads(response.choices[0].message.content)
+    _save_agent_log(state["run_id"], "architect", schema_dict)
+    
+    return {"architect_schema": json.dumps(schema_dict, indent=2)}
+
+
+def coder_node(state: HandoffState):
+    time.sleep(1)
+    client = _get_client("coder")
+    current_retries = state.get("retry_count", 0)
+    
+    system_content = (
+        "You are an Expert Senior Developer. "
+        "CRITICAL CONSTRAINTS: "
+        "1. Return ONLY a raw JSON object with a single key 'files', mapping filenames to source code strings. "
+        "2. CONSOLIDATE your code into a single App.tsx file. "
+        "3. Output ONLY valid JSON. DO NOT wrap in markdown."
+    )
+    
+    if state.get("feedback"):
+        system_content += f"\n\nCRITICAL FIX REQUIRED: {state['feedback']}"
+
+    try:
+        response = client.chat.completions.create(
+            model="openai/gpt-oss-120b",
+            messages=[
+                {"role": "system", "content": system_content},
+                {"role": "user", "content": state["architect_schema"]},
+            ],
+            response_format={"type": "json_object"},
+            max_tokens=6000,
+            temperature=0.2
+        )
+        
+        raw_output = response.choices[0].message.content.strip()
+        
+        # Robust JSON extraction
+        start_idx = raw_output.find('{')
+        end_idx = raw_output.rfind('}')
+        clean_json_str = raw_output[start_idx:end_idx+1] if (start_idx != -1 and end_idx != -1 and end_idx > start_idx) else raw_output
+        
+        result = json.loads(clean_json_str)
+        files = result.get("files", result)
+        
+        return {"artifacts": {"files": files}, "retry_count": current_retries + 1, "feedback": ""}
+        
+    except Exception as e:
+        error_msg = str(e)
+        print(f"Coder Node Attempt {current_retries + 1} Failed: {error_msg}")
+        
+        feedback_msg = (
+            "Your JSON output was truncated. You MUST consolidate all code."
+            if "Expecting value" in error_msg or "Unterminated string" in error_msg
+            else f"JSON validation failed. Escape your quotes. Error: {error_msg}"
+        )
+        
+        return {
+            "artifacts": {"files": {"error.log": f"Failed: {error_msg}"}},
+            "retry_count": current_retries + 1,
+            "feedback": feedback_msg,
+            "is_approved": False
+        }
+
+def reviewer_node(state: HandoffState):
+    if not state.get("artifacts") or "error.log" in state["artifacts"].get("files", {}):
+        return {"is_approved": False}
+        
     client = _get_client("coder")
     system_content = (
         "You are a strict Senior Staff Engineer reviewing code generated by a developer. "
-        "Evaluate if the generated files fully satisfy the Architect's requirements and contain no severe logic errors. "
-        "Return a JSON object with exactly two fields: "
-        "1. 'is_approved': a boolean (true if the code is excellent, false if it needs work). "
-        "2. 'feedback': a string detailing exactly what needs to be fixed (leave empty if approved)."
+        "Return a JSON object with two fields: "
+        "1. 'is_approved': a boolean. "
+        "2. 'feedback': a string detailing what needs to be fixed (leave empty if approved)."
     )
     
-    prompt = f"Architect Requirements:\n{schema_json}\n\nGenerated Files to Review:\n{json.dumps(artifacts, indent=2)}"
+    prompt = f"Architect Requirements:\n{state['architect_schema']}\n\nGenerated Files:\n{json.dumps(state['artifacts'], indent=2)}"
     
     response = client.chat.completions.create(
         model="qwen/qwen3.8-27b",
@@ -72,147 +155,67 @@ def _internal_code_checker(artifacts: dict, schema_json: str) -> dict:
         ],
         response_format={"type": "json_object"}
     )
-    return json.loads(response.choices[0].message.content)
-
-
-def agent_1_architect(prompt: str, run_id: str) -> ArchitectSchema:
-    time.sleep(1)
-    try:
-        client = _get_client("architect")
-        response = client.chat.completions.create(
-            model="openai/gpt-oss-120b",
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are an Expert Software Architect designing a technical specification for a downstream Coder agent. "
-                        "Analyze the requested software task and break it down into actionable requirements. "
-                        "Return a strictly formatted JSON object with exactly three fields: "
-                        "1. 'goal': A clear, comprehensive string defining the core objective and expected business logic. "
-                        "2. 'constraints': A list of strings detailing strict technical restrictions, security requirements, edge cases to handle, and performance considerations. "
-                        "3. 'tech_stack': A list of strings specifying the exact modern frameworks, libraries, and tools required for an optimal implementation. "
-                        "Output ONLY valid JSON with no markdown wrapping or conversational text."
-                    )
-                },
-                {"role": "user", "content": f"Task: {prompt}"},
-            ],
-            response_format={"type": "json_object"},
-        )
-        result = ArchitectSchema.model_validate_json(response.choices[0].message.content)
-        _save_agent_log(run_id, "architect", result.model_dump())
-        return result
-    except Exception as e:
-        _save_agent_log(run_id, "architect", {"error": str(e)})
-        raise e
-
-
-def agent_2_coder(schema: ArchitectSchema, run_id: str, feedback: str = None) -> dict:
-    time.sleep(1)
-    client = _get_client("coder")
-    schema_json = schema.model_dump_json(indent=2)
     
-    max_hidden_retries = 3
-    current_feedback = feedback
-    
-    final_artifacts = {"files": {"error.log": "Failed to generate valid JSON code after 3 attempts."}}
-
-    for attempt in range(max_hidden_retries):
-        raw_output = ""
-        try:
-            system_content = (
-                "You are an Expert Senior Developer translating a specification into code. "
-                "CRITICAL CONSTRAINTS: "
-                "1. Return ONLY a raw JSON object with a single key 'files', mapping filenames to source code strings. "
-                "2. To prevent token limits, CONSOLIDATE your code. Put all React components into a single 'App.tsx' file instead of splitting them up. "
-                "3. Do not generate generic boilerplate config files (like vite.config.ts or tailwind.config.js) unless absolutely strictly necessary. "
-                "4. Output ONLY valid, properly escaped JSON. DO NOT wrap the output in markdown blocks. Start immediately with { and end with }."
-            )
-            
-            if current_feedback:
-                system_content += f"\n\nCRITICAL FIX REQUIRED: {current_feedback}"
-
-            response = client.chat.completions.create(
-                model="openai/gpt-oss-120b",
-                messages=[
-                    {"role": "system", "content": system_content},
-                    {"role": "user", "content": schema_json},
-                ],
-                response_format={"type": "json_object"},
-                max_tokens=6000,
-                temperature=0.2
-            )
-            
-            raw_output = response.choices[0].message.content.strip()
-            
-            # Robust JSON Extraction to strip markdown backticks
-            start_idx = raw_output.find('{')
-            end_idx = raw_output.rfind('}')
-            
-            if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
-                clean_json_str = raw_output[start_idx:end_idx+1]
-            else:
-                clean_json_str = raw_output
-            
-            result = json.loads(clean_json_str)
-            
-            files = result.get("files", {})
-            if not files:
-                files = result 
-                
-            final_artifacts = {"files": files}
-            
-            review = _internal_code_checker(final_artifacts, schema_json)
-            
-            if review.get("is_approved") is True:
-                break
-                
-            current_feedback = review.get("feedback", "Code rejected by reviewer. Please rewrite.")
-            
-        except Exception as e:
-            error_msg = str(e)
-            print(f"Agent 2 Attempt {attempt + 1} Failed: {error_msg}")
-            
-            if "Expecting value" in error_msg or "Unterminated string" in error_msg:
-                current_feedback = "Your JSON output was truncated because it was too long. You MUST consolidate all code into a single App.tsx file and remove configuration files."
-            else:
-                current_feedback = f"JSON validation failed. Ensure quotes inside your code strings are escaped correctly. Error: {error_msg}"
-            
-            time.sleep(2) 
-
-    _save_agent_log(run_id, "coder", final_artifacts)
-    return final_artifacts
+    review = json.loads(response.choices[0].message.content)
+    return {"is_approved": review.get("is_approved", False), "feedback": review.get("feedback", "")}
 
 
-def agent_3_deployer(artifacts: dict, run_id: str) -> dict:
+def deployer_node(state: HandoffState):
     time.sleep(1)
+    client = _get_client("deployer")
+    
+    response = client.chat.completions.create(
+        model="qwen/qwen3.8-27b",
+        messages=[
+            {
+                "role": "system",
+                "content": "You are an Expert DevOps Engineer. Return a JSON object with: 'readiness', 'port', 'port_status', and 'deployment_notes'."
+            },
+            {"role": "user", "content": json.dumps(state["artifacts"], indent=2)},
+        ],
+        response_format={"type": "json_object"},
+    )
+    
+    result = json.loads(response.choices[0].message.content)
+    _save_agent_log(state["run_id"], "deployer", result)
+    return {}
+
+
+# --- 3. Define Routing Logic ---
+def route_after_review(state: HandoffState):
+    """Conditionally route back to coder if rejected, or forward to deployer."""
+    if state["is_approved"] or state["retry_count"] >= 3:
+        _save_agent_log(state["run_id"], "coder", state["artifacts"])
+        return "deployer"
+    return "coder"
+
+
+# --- 4. Build the Graph ---
+workflow = StateGraph(HandoffState)
+
+workflow.add_node("architect", architect_node)
+workflow.add_node("coder", coder_node)
+workflow.add_node("reviewer", reviewer_node)
+workflow.add_node("deployer", deployer_node)
+
+workflow.add_edge(START, "architect")
+workflow.add_edge("architect", "coder")
+workflow.add_edge("coder", "reviewer")
+workflow.add_conditional_edges("reviewer", route_after_review)
+workflow.add_edge("deployer", END)
+
+app_graph = workflow.compile()
+
+# --- 5. Export Execution Function ---
+def run_agent_graph(prompt: str, run_id: str):
+    initial_state = {
+        "run_id": run_id,
+        "prompt": prompt,
+        "retry_count": 0,
+        "feedback": "",
+        "is_approved": False
+    }
     try:
-        client = _get_client("deployer")
-        response = client.chat.completions.create(
-            model="qwen/qwen3.8-27b",
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are an Expert DevOps Engineer conducting a deployment readiness review of application files. "
-                        "Analyze the provided code files for deployment viability, missing dependencies, security vulnerabilities, and network configurations. "
-                        "Return a strictly formatted JSON object with exactly four fields: "
-                        "1. 'readiness': A boolean (true/false) indicating if the code is structurally ready to be deployed or containerized. "
-                        "2. 'port': An integer representing the exposed application port (or null if not applicable). "
-                        "3. 'port_status': A string evaluating the port configuration (e.g., 'Valid default', 'None detected'). "
-                        "4. 'deployment_notes': A list of strings detailing specific security warnings, dependency issues, or build recommendations. "
-                        "Output ONLY valid JSON."
-                    )
-                },
-                {
-                    "role": "user",
-                    "content": json.dumps(artifacts, indent=2),
-                },
-            ],
-            response_format={"type": "json_object"},
-        )
-        result = json.loads(response.choices[0].message.content)
-        _save_agent_log(run_id, "deployer", result)
-        return result
+        app_graph.invoke(initial_state)
     except Exception as e:
-        _save_agent_log(run_id, "deployer", {"error": str(e)})
-        raise e
+        print(f"Graph execution failed: {e}")
