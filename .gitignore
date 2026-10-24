@@ -1,11 +1,32 @@
+# Python virtual environments
+/.venv/
+/backend/venv/
+/venv/
+**/.venv/
+**/venv/
+**/env/
+
+# Python installed packages and cache
+**/site-packages/
+__pycache__/
+*.py[cod]
+
+# Environment secrets
 .env
 .env.*
 !.env.example
 **/.env
 **/.env.*
 !**/.env.example
-__pycache__/
-*.py[cod]
-backend/venv/
+
+# Node.js dependencies
+node_modules/
 frontend/node_modules/
+
+# Build output
+dist/
+build/
 frontend/dist/
+
+# macOS files
+.DS_Store
